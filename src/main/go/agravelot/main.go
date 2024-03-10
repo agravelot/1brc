@@ -8,21 +8,15 @@ import (
 	"math"
 	"os"
 	"runtime/pprof"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// format : <string: station name>;<double: measurement>
-
-// Get min, mean, and max
-
-//type Line struct {
-//	city         string
-//	temperatures []float32
-//}
-
 type TemperatureStats struct {
+	city  string
 	min   float64
 	max   float64
 	total float64
@@ -32,6 +26,11 @@ type TemperatureStats struct {
 type Line struct {
 	city        string
 	temperature string
+}
+
+type Toto struct {
+	chanLine chan Line
+	chanStat chan TemperatureStats
 }
 
 var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
@@ -46,27 +45,13 @@ func readFile(c chan Line, chanReadCompleted chan bool) {
 
 	scanner := bufio.NewScanner(file)
 
-	count := 0
-
 	for scanner.Scan() {
 		values := strings.Split(scanner.Text(), ";")
-		count++
-
-		// if count == 10000000 {
-		// 	break
-		// }
-
 		c <- Line{city: values[0], temperature: values[1]}
 	}
 
-	chanReadCompleted <- true
 	close(c)
 	close(chanReadCompleted)
-}
-
-type Toto struct {
-	chanLine chan Line
-	chanStat chan TemperatureStats
 }
 
 func roundFloat(val float64, precision uint) float64 {
@@ -74,12 +59,69 @@ func roundFloat(val float64, precision uint) float64 {
 	return math.Ceil(val*ratio) / ratio
 }
 
+// TODO Add chan orientation
+func routeMessage(channels map[byte]Toto, chanLine chan Line) {
+	for b := range chanLine {
+		toto, ok := channels[b.city[0]]
+		if !ok {
+			cityChannel := make(chan Line, 100000)
+			resChannel := make(chan TemperatureStats)
+			toto = Toto{chanLine: cityChannel, chanStat: resChannel}
+			channels[b.city[0]] = toto
+			go citiesCompute(channels[b.city[0]])
+		}
+		toto.chanLine <- b
+	}
+
+	for _, v := range channels {
+		close(v.chanLine)
+	}
+}
+
+func citiesCompute(toto Toto) {
+	results := make(map[string]TemperatureStats)
+
+	for b := range toto.chanLine {
+		temp, err := strconv.ParseFloat(b.temperature, 64)
+		if err != nil {
+			panic(err)
+		}
+
+		result, ok := results[b.city]
+		if !ok {
+			results[b.city] = TemperatureStats{min: temp, max: temp, total: temp, count: 1, city: b.city}
+			continue
+		}
+
+		if temp < result.min {
+			result.min = temp
+		} else if temp > result.max {
+			result.max = temp
+		}
+
+		result.total += temp
+		result.count++
+
+		results[b.city] = result
+	}
+
+	// Order by city name
+	keys := make([]string, 0, len(results))
+	for k := range results {
+		keys = append(keys, k)
+	}
+
+	slices.Sort(keys)
+
+	for _, k := range keys {
+		toto.chanStat <- results[k]
+	}
+
+	close(toto.chanStat)
+}
+
 func main() {
 	flag.Parse()
-
-	log.Println(flag.Args()[len(flag.Args())-1:])
-
-	log.Println(*cpuprofile)
 
 	if *cpuprofile != "" {
 		log.Println("add profiling")
@@ -94,92 +136,53 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	chanLine := make(chan Line, 100000)
+	chanLine := make(chan Line, 1000000)
 	chanReadCompleted := make(chan bool)
 
 	go readFile(chanLine, chanReadCompleted)
 
-	channels := make(map[string]Toto)
-
-	cityCompute := func(toto Toto) {
-		result := TemperatureStats{}
-		for b := range toto.chanLine {
-			// log.Printf("city: %s, temperature: %s", b.city, b.temperature)
-			temp, err := strconv.ParseFloat(b.temperature, 64)
-			if err != nil {
-				log.Printf("error parsing temperature: %s", b.temperature)
-				continue
-			}
-
-			if result.min == 0 || temp < result.min {
-				result.min = temp
-			}
-			if result.max == 0 || temp > result.max {
-				result.max = temp
-			}
-
-			result.total += temp
-			result.count++
-			// log.Printf("count: %f", result.count)
-		}
-
-		toto.chanStat <- result
-		close(toto.chanStat)
-	}
+	channels := make(map[byte]Toto)
 
 	// Route into city channels
-	go func() {
-		for b := range chanLine {
-			toto, ok := channels[b.city]
-			if !ok {
-				// log.Printf("new city channel created: %s", b.city)
-				cityChannel := make(chan Line, 10000)
-				// TODO buffer size
-				resChannel := make(chan TemperatureStats)
-				toto = Toto{chanLine: cityChannel, chanStat: resChannel}
-				channels[b.city] = toto
-				go cityCompute(channels[b.city])
-			}
-			// log.Printf("route into city channel: %s", b.city)
-			toto.chanLine <- b
-			// TODO Gracefully stop
-		}
-		for _, v := range channels {
-			close(v.chanLine)
-			// log.Printf("close channel: %s", k)
-		}
+	go routeMessage(channels, chanLine)
+	time.Sleep(1 * time.Second)
 
-		// log.Println(" end Route into city channels")
-	}()
-
-	// Wait for read to complete
-
-	// log.Println("waiting read completed")
 	<-chanReadCompleted
-	// log.Println("read completed from main")
-	// time.Sleep(time.Second)
-	// log.Println(channels)
-
-	keys := make([]string, 0, len(channels))
+	keys := make([]byte, 0, len(channels))
 	for k := range channels {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
 
-	fmt.Printf("{")
-	for i, k := range keys {
-		if i != 0 {
-			fmt.Print(", ")
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i] < keys[j]
+	})
+
+	count := 0
+
+	fmt.Print("{")
+	for _, k := range keys {
+		// if i != 0 {
+		// 	fmt.Print(", ")
+		// }
+		toto, ok := channels[k]
+		if !ok {
+			panic("channel not found")
 		}
-		a := <-channels[k].chanStat
-		// log.Printf("city: %s, min: %f, total: %f, count: %f, avg: %f, max: %f", k, a.min, a.total, a.count, a.total/a.count, a.max)
-		fmt.Printf("%s=%.1f/%.1f/%.1f",
-			k,
-			roundFloat(a.min, 1),
-			roundFloat(a.total/a.count, 1),
-			roundFloat(a.max, 1),
-		)
+
+		for v := range toto.chanStat {
+			if count != 0 {
+				fmt.Print(", ")
+			}
+
+			fmt.Printf("%s=%.1f/%.1f/%.1f",
+				v.city,
+				roundFloat(v.min, 1),
+				roundFloat(v.total/v.count, 1),
+				roundFloat(v.max, 1),
+			)
+			count++
+		}
 	}
 
-	fmt.Printf("}\n")
+	fmt.Print("}\n")
 }
